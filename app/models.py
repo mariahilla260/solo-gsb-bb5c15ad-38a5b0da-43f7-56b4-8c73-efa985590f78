@@ -499,3 +499,222 @@ class RedundancyAuditResponse(BaseModel):
         discriminator="feasible",
         description="base_contradiction 时为基础观测的矛盾诊断；ok 时为 null",
     )
+
+
+# ---------------------------------------------------------------------------
+# 时钟漂移
+# ---------------------------------------------------------------------------
+
+
+# 漂移时段 / 参考锚时段合成标识的保留前缀，观测 ID 不允许占用，
+# 以便矛盾环中的边来源可以无歧义地区分原观测与漂移时段。
+DRIFT_ID_PREFIX = "drift:"
+REF_ID_PREFIX = "ref:"
+
+
+class DriftObservationIn(BaseModel):
+    """时刻 time 秒处的一条有向观测：target 时钟 - source 时钟 ∈ [min, max]。"""
+
+    id: str = Field(..., min_length=1, description="观测的唯一 ID")
+    source: str = Field(..., min_length=1, description="被减时钟节点 A")
+    target: str = Field(..., min_length=1, description="被减时钟节点 B")
+    min: float = Field(..., alias="min", description="区间下界（毫秒）")
+    max: float = Field(..., alias="max", description="区间上界（毫秒）")
+    time: int = Field(
+        ...,
+        ge=0,
+        strict=True,
+        description="观测发生的整数采样秒数（非负整数，不接受布尔/浮点）",
+    )
+
+    model_config = {"populate_by_name": True, "extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _check(self) -> "DriftObservationIn":
+        if not math.isfinite(self.min) or not math.isfinite(self.max):
+            raise ValueError("min/max 必须为有限数值")
+        if self.min > self.max:
+            raise ValueError(
+                f"观测 {self.id} 的区间非法：min({self.min}) > max({self.max})"
+            )
+        if self.id.startswith((DRIFT_ID_PREFIX, REF_ID_PREFIX)):
+            raise ValueError(
+                f"观测 {self.id} 的 ID 非法：前缀 '{DRIFT_ID_PREFIX}' / "
+                f"'{REF_ID_PREFIX}' 为漂移时段标识保留"
+            )
+        return self
+
+
+class DriftRateIn(BaseModel):
+    """一个非参考节点的非负最大漂移速率（毫秒/秒）。"""
+
+    node: str = Field(..., min_length=1, description="时钟节点")
+    max_rate: float = Field(
+        ..., ge=0.0, description="最大漂移速率（毫秒/秒），须为非负有限数值"
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _check(self) -> "DriftRateIn":
+        if not math.isfinite(self.max_rate):
+            raise ValueError("max_rate 必须为有限数值")
+        return self
+
+
+class DriftDiagnosisRequest(BaseModel):
+    """时钟漂移诊断请求。
+
+    时间轴由观测时刻与查询时刻合并去重后按升序排列；相邻时刻同一节点
+    偏移变化的绝对值不得超过该节点速率乘时间差，参考节点偏移恒为 0。
+    """
+
+    reference: str = Field(..., min_length=1, description="参考时钟节点（偏移恒为 0）")
+    observations: List[DriftObservationIn] = Field(
+        default_factory=list, description="带整数采样秒数的有向时钟观测列表"
+    )
+    rates: List[DriftRateIn] = Field(
+        default_factory=list,
+        description="各非参考节点的非负最大漂移速率（毫秒/秒）；"
+        "每个非参考节点必须且至多给出一条，参考节点不允许给出",
+    )
+    queries: List[int] = Field(
+        default_factory=list,
+        max_length=8,
+        description="至多 8 个查询秒数（非负整数、不可重复），默认空数组",
+    )
+    nodes: Optional[List[str]] = Field(
+        default=None,
+        description="显式声明的全部节点；缺省时取观测端点与参考节点的并集",
+    )
+    name: Optional[str] = Field(
+        default=None, description="可选名称，响应原样回显"
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _check(self) -> "DriftDiagnosisRequest":
+        if self.nodes is not None:
+            if len(self.nodes) != len(set(self.nodes)):
+                raise ValueError("nodes 中存在重复节点")
+            if self.reference not in self.nodes:
+                raise ValueError("reference 必须包含在 nodes 中")
+
+        ids = [o.id for o in self.observations]
+        if len(ids) != len(set(ids)):
+            raise ValueError("observations 中存在重复的观测 ID")
+
+        # 严格整数校验：Field(strict=True) 拒绝布尔/浮点；这里再防御性兜底。
+        for q in self.queries:
+            if isinstance(q, bool) or not isinstance(q, int):
+                raise ValueError("queries 必须为整数秒数")
+            if q < 0:
+                raise ValueError("queries 秒数必须非负")
+        if len(self.queries) != len(set(self.queries)):
+            raise ValueError("queries 中存在重复的查询秒数")
+
+        effective = set(self.effective_nodes())
+        rate_nodes = [r.node for r in self.rates]
+        if len(rate_nodes) != len(set(rate_nodes)):
+            raise ValueError("rates 中存在重复的节点速率")
+        rate_set = set(rate_nodes)
+        if self.reference in rate_set:
+            raise ValueError("参考节点偏移恒为 0，不允许给出漂移速率")
+        unknown = rate_set - effective
+        if unknown:
+            raise ValueError(
+                f"rates 包含既不在 nodes 中、也不是观测端点的节点：{sorted(unknown)}"
+            )
+        missing = effective - rate_set - {self.reference}
+        if missing:
+            raise ValueError(f"以下节点缺少漂移速率：{sorted(missing)}")
+
+        instants = {o.time for o in self.observations} | set(self.queries)
+        if len(instants) > 40:
+            raise ValueError(
+                f"观测时刻与查询时刻合计至多 40 个不同时刻，当前为 {len(instants)} 个"
+            )
+
+        # 防御浮点溢出：漂移边权 = 速率 × 相邻时刻差，最大间隔上乘积
+        # 非有限（inf）时求解器无法表示，按非法请求（422）拒绝。
+        if len(instants) >= 2:
+            ordered_instants = sorted(instants)
+            max_span = max(b - a for a, b in zip(ordered_instants, ordered_instants[1:]))
+            for r in self.rates:
+                if not math.isfinite(r.max_rate * max_span):
+                    raise ValueError(
+                        f"节点 {r.node} 的速率 {r.max_rate} 毫秒/秒乘最大时间间隔 "
+                        f"{max_span} 秒超出可表示范围"
+                    )
+        return self
+
+    def effective_nodes(self) -> List[str]:
+        """合并显式节点、观测端点与参考节点。"""
+        return collect_nodes(self.nodes, self.reference, self.observations)
+
+
+class DriftNodeBound(BaseModel):
+    """某查询时刻某节点相对参考节点的最紧偏移界（毫秒）。"""
+
+    time: int = Field(..., description="查询秒数")
+    node: str = Field(..., description="时钟节点")
+    lower: Optional[float] = Field(
+        ..., description="x_node(time) - x_reference 的最紧下界（毫秒），不可达时为 null"
+    )
+    upper: Optional[float] = Field(
+        ..., description="x_node(time) - x_reference 的最紧上界（毫秒），不可达时为 null"
+    )
+
+
+class DriftCycleStep(BaseModel):
+    """漂移矛盾环中的一步：原观测边、漂移时段边或参考锚边。"""
+
+    observation_id: str = Field(
+        ...,
+        description="边来源：observation 为原观测 ID；drift 为漂移时段标识 "
+        "'drift:<node>:<t0>:<t1>'；reference 为参考锚时段 'ref:<t0>:<t1>'",
+    )
+    edge_kind: Literal["observation", "drift", "reference"] = Field(
+        ..., description="observation=时刻观测边，drift=节点漂移时段边，reference=参考锚边"
+    )
+    node: Optional[str] = Field(
+        ..., description="漂移时段所属节点；observation/reference 边为 null"
+    )
+    from_node: str = Field(..., description="边起点变量的节点")
+    to_node: str = Field(..., description="边终点变量的节点")
+    from_time: int = Field(..., description="边起点变量的时刻（秒）")
+    to_time: int = Field(..., description="边终点变量的时刻（秒）")
+    constraint: Literal["upper", "lower"] = Field(
+        ..., description="upper=对应 max 约束边，lower=对应 -min 约束边"
+    )
+    weight: float = Field(..., description="该边在差分约束图中的权重（毫秒）")
+    bound: float = Field(..., description="约束对应的原始端点值（毫秒）")
+
+
+class DriftContradictionCycle(BaseModel):
+    steps: List[DriftCycleStep] = Field(..., description="沿矛盾环方向排列的边")
+    accumulated_bound: float = Field(
+        ..., description="环上权重之和（负数），即推出的 0 <= 该负数"
+    )
+    contradiction: str = Field(..., description="人类可读的矛盾式，例如 '0 <= -2.0'")
+
+
+class FeasibleDriftDiagnosis(BaseModel):
+    feasible: Literal[True] = True
+    reference: str
+    name: Optional[str] = None
+    query_bounds: List[DriftNodeBound] = Field(
+        ...,
+        description="各查询时刻各节点相对参考节点的最紧上下界，"
+        "按 (time, node) 升序；不可达方向为 null，参考节点两界恒为 0.0",
+    )
+
+
+class InfeasibleDriftDiagnosis(BaseModel):
+    feasible: Literal[False] = False
+    name: Optional[str] = None
+    cycle: DriftContradictionCycle
+
+
+DriftDiagnosisResponse = Union[FeasibleDriftDiagnosis, InfeasibleDriftDiagnosis]

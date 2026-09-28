@@ -20,8 +20,14 @@ from .models import (
     CycleStep,
     DiagnosisRequest,
     DiagnosisResponse,
+    DriftCycleStep,
+    DriftDiagnosisRequest,
+    DriftDiagnosisResponse,
+    DriftContradictionCycle,
     FeasibleDiagnosis,
+    FeasibleDriftDiagnosis,
     InfeasibleDiagnosis,
+    InfeasibleDriftDiagnosis,
     NodeOffset,
     RedundancyAuditRequest,
     RedundancyAuditResponse,
@@ -34,10 +40,13 @@ from .models import (
 )
 from .solver import (
     CalibrationCandidate,
+    DriftObservation,
+    DriftRate,
     Observation,
     WindowEvent,
     audit_redundancy,
     diagnose,
+    diagnose_drift,
     plan_calibration,
     plan_window_peak,
     suggest_repair,
@@ -53,9 +62,11 @@ app = FastAPI(
         "并可进一步给出最小观测删除集合的修复建议；"
         "还可从带成本的候选观测中规划满足目标界宽的最小成本校准方案；"
         "另可在真实时间窗口下求同时入窗的最大事件集合及可行偏移见证；"
-        "并可逐条审计观测区间是否已被其余观测蕴含（冗余审计）。"
+        "并可逐条审计观测区间是否已被其余观测蕴含（冗余审计）；"
+        "漂移诊断接口则在整数秒时间轴上结合相邻时刻的最大漂移速率，"
+        "判定整条时间轴是否可行并给出查询时刻的最紧偏移界。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -383,4 +394,56 @@ def events_window_peak(request: WindowPeakRequest) -> WindowPeakResponse:
             for node in sorted(offsets)
         ],
         diagnosis=None,
+    )
+
+
+@app.post(
+    "/api/v1/diagnose/drift",
+    response_model=DriftDiagnosisResponse,
+    tags=["diagnosis"],
+)
+def diagnose_drift_once(request: DriftDiagnosisRequest) -> DriftDiagnosisResponse:
+    """时钟漂移诊断：整数秒时间轴上的可行性与查询时刻最紧偏移界。
+
+    把每个 (节点, 时刻) 建模为一个偏移变量：时刻观测与同节点相邻时刻间
+    「偏移变化不超过速率乘时间差」的漂移区间都展开为差分约束边，
+    参考节点各时刻由零权边钉为 0；随后复用同一差分约束求解器：
+    有负环即时间轴不可行，返回含原观测 ID 或漂移时段标识
+    （``drift:<node>:<t0>:<t1>`` / ``ref:<t0>:<t1>``）的矛盾环；
+    可行时按 (time, node) 排序返回各查询时刻各节点相对参考节点的
+    最紧上下界，不可达方向为 null。
+    """
+    result = diagnose_drift(
+        nodes=request.effective_nodes(),
+        reference=request.reference,
+        observations=[
+            DriftObservation(
+                id=o.id,
+                source=o.source,
+                target=o.target,
+                min=o.min,
+                max=o.max,
+                time=o.time,
+            )
+            for o in request.observations
+        ],
+        rates=[DriftRate(node=r.node, rate=r.max_rate) for r in request.rates],
+        query_times=list(request.queries),
+    )
+    if result["feasible"]:
+        return FeasibleDriftDiagnosis(
+            name=request.name,
+            reference=result["reference"],
+            query_bounds=result["query_bounds"],
+        )
+
+    cycle = result["cycle"]
+    steps: List[DriftCycleStep] = [DriftCycleStep(**s) for s in cycle["steps"]]
+    return InfeasibleDriftDiagnosis(
+        name=request.name,
+        cycle=DriftContradictionCycle(
+            steps=steps,
+            accumulated_bound=cycle["accumulated_bound"],
+            contradiction=cycle["contradiction"],
+        ),
     )

@@ -1219,3 +1219,290 @@ def test_redundancy_audit_inherited_validation_still_applies():
         json=_redundancy_payload(reference="Z", nodes=["A", "B"]),
     )
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 时钟漂移
+# ---------------------------------------------------------------------------
+
+
+def _drift_payload(**overrides):
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10, "time": 0},
+            {"id": "o2", "source": "A", "target": "B", "min": 90, "max": 100, "time": 10},
+        ],
+        "rates": [{"node": "B", "max_rate": 10}],
+        "queries": [0, 5, 10],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_drift_feasible_returns_sorted_query_bounds():
+    resp = client.post("/api/v1/diagnose/drift", json=_drift_payload())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["feasible"] is True
+    assert data["reference"] == "A"
+    assert [(b["time"], b["node"]) for b in data["query_bounds"]] == [
+        (0, "A"), (0, "B"), (5, "A"), (5, "B"), (10, "A"), (10, "B")
+    ]
+    by_key = {(b["time"], b["node"]): b for b in data["query_bounds"]}
+    assert by_key[(0, "A")]["lower"] == 0.0 and by_key[(0, "A")]["upper"] == 0.0
+    assert (by_key[(0, "B")]["lower"], by_key[(0, "B")]["upper"]) == (0.0, 10.0)
+    # t=5 为两观测区间与漂移锥的交：[40,60]
+    assert (by_key[(5, "B")]["lower"], by_key[(5, "B")]["upper"]) == (40.0, 60.0)
+    assert (by_key[(10, "B")]["lower"], by_key[(10, "B")]["upper"]) == (90.0, 100.0)
+
+
+def test_drift_feasible_no_query_fields_cycle_absent():
+    data = client.post(
+        "/api/v1/diagnose/drift", json=_drift_payload(queries=[])
+    ).json()
+    assert data["feasible"] is True
+    assert data["query_bounds"] == []
+    assert "cycle" not in data
+
+
+def test_drift_infeasible_returns_cycle_with_segment_ids_and_no_bounds():
+    payload = _drift_payload(
+        rates=[{"node": "B", "max_rate": 5}],
+    )
+    resp = client.post("/api/v1/diagnose/drift", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["feasible"] is False
+    assert "query_bounds" not in data
+    cycle = data["cycle"]
+    assert cycle["accumulated_bound"] < 0
+    assert cycle["contradiction"] == f"0 <= {cycle['accumulated_bound']}"
+    ids = {s["observation_id"] for s in cycle["steps"]}
+    assert {"o1", "o2"} <= ids
+    assert any(sid.startswith("drift:B:") for sid in ids)
+    assert any(sid.startswith("ref:") for sid in ids)
+    for s in cycle["steps"]:
+        assert set(s) == {
+            "observation_id", "edge_kind", "node",
+            "from_node", "to_node", "from_time", "to_time",
+            "constraint", "weight", "bound",
+        }
+        if s["edge_kind"] == "drift":
+            assert s["node"] == "B"
+            assert s["from_node"] == s["to_node"] == "B"
+        else:
+            assert s["node"] is None
+    # 环沿 (节点, 时刻) 闭合
+    steps = cycle["steps"]
+    for i, s in enumerate(steps):
+        nxt = steps[(i + 1) % len(steps)]
+        assert (s["to_node"], s["to_time"]) == (nxt["from_node"], nxt["from_time"])
+
+
+def test_drift_infeasible_same_time_observation_cycle():
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10, "time": 0},
+            {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4, "time": 0},
+        ],
+        "rates": [{"node": "B", "max_rate": 1}],
+        "queries": [],
+    }
+    data = client.post("/api/v1/diagnose/drift", json=payload).json()
+    assert data["feasible"] is False
+    assert {s["observation_id"] for s in data["cycle"]["steps"]} == {"o1", "o2"}
+    assert all(s["edge_kind"] == "observation" for s in data["cycle"]["steps"])
+
+
+def test_drift_unreachable_direction_is_null():
+    # Z 显式声明且有速率，但与 A 无任何观测连接：两个方向均不可达
+    payload = {
+        "reference": "A",
+        "nodes": ["A", "Z"],
+        "observations": [],
+        "rates": [{"node": "Z", "max_rate": 1}],
+        "queries": [2],
+    }
+    data = client.post("/api/v1/diagnose/drift", json=payload).json()
+    assert data["feasible"] is True
+    z = next(b for b in data["query_bounds"] if b["node"] == "Z")
+    assert z["lower"] is None and z["upper"] is None
+    a = next(b for b in data["query_bounds"] if b["node"] == "A")
+    assert a["lower"] == 0.0 and a["upper"] == 0.0
+
+
+def test_drift_name_echoed():
+    data = client.post(
+        "/api/v1/diagnose/drift", json=_drift_payload(name="timeline-1")
+    ).json()
+    assert data["name"] == "timeline-1"
+
+
+def test_drift_nodes_default_to_observation_endpoints():
+    data = client.post("/api/v1/diagnose/drift", json=_drift_payload()).json()
+    nodes_at_5 = {b["node"] for b in data["query_bounds"] if b["time"] == 5}
+    assert nodes_at_5 == {"A", "B"}
+
+
+def test_drift_zero_rate_pins_offset():
+    payload = _drift_payload(
+        observations=[
+            {"id": "o1", "source": "A", "target": "B", "min": 1, "max": 5, "time": 0}
+        ],
+        rates=[{"node": "B", "max_rate": 0}],
+        queries=[8],
+    )
+    data = client.post("/api/v1/diagnose/drift", json=payload).json()
+    b = next(x for x in data["query_bounds"] if x["node"] == "B")
+    assert b["lower"] == 1.0 and b["upper"] == 5.0
+
+
+def test_drift_duplicate_observation_id_rejected():
+    payload = _drift_payload(
+        observations=[
+            {"id": "x", "source": "A", "target": "B", "min": 0, "max": 1, "time": 0},
+            {"id": "x", "source": "B", "target": "A", "min": 0, "max": 1, "time": 1},
+        ]
+    )
+    assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422
+
+
+def test_drift_missing_node_rate_rejected():
+    # C 出现在观测中但未给速率
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "o1", "source": "B", "target": "C", "min": 0, "max": 1, "time": 0}
+        ],
+        "rates": [{"node": "B", "max_rate": 1}],
+        "queries": [],
+    }
+    assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422
+
+
+def test_drift_rate_for_reference_rejected():
+    payload = _drift_payload(
+        rates=[{"node": "A", "max_rate": 1}, {"node": "B", "max_rate": 1}]
+    )
+    assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422
+
+
+def test_drift_duplicate_rate_node_rejected():
+    payload = _drift_payload(
+        rates=[{"node": "B", "max_rate": 1}, {"node": "B", "max_rate": 2}]
+    )
+    assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422
+
+
+def test_drift_rate_for_unknown_node_rejected():
+    payload = _drift_payload(rates=[{"node": "Z", "max_rate": 1}])
+    assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422
+
+
+def test_drift_negative_rate_rejected():
+    payload = _drift_payload(rates=[{"node": "B", "max_rate": -0.1}])
+    assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422
+
+
+def test_drift_non_integer_time_rejected():
+    for bad_time in (1.5, -1):
+        payload = _drift_payload(
+            observations=[
+                {"id": "o9", "source": "A", "target": "B",
+                 "min": 0, "max": 1, "time": bad_time}
+            ]
+        )
+        assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422
+
+
+def test_drift_boolean_time_rejected():
+    # JSON 中布尔以 true/false 提交，严格整数模式必须拒绝
+    body = (
+        '{"reference":"A","queries":[],'
+        '"observations":[{"id":"o1","source":"A","target":"B",'
+        '"min":0,"max":1,"time":true}],'
+        '"rates":[{"node":"B","max_rate":1}]}'
+    )
+    resp = client.post(
+        "/api/v1/diagnose/drift",
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 422
+
+
+def test_drift_too_many_queries_rejected():
+    payload = _drift_payload(queries=list(range(9)))
+    assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422
+
+
+def test_drift_duplicate_query_rejected():
+    payload = _drift_payload(queries=[1, 1])
+    assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422
+
+
+def test_drift_negative_query_rejected():
+    payload = _drift_payload(queries=[-1])
+    assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422
+
+
+def test_drift_more_than_40_instants_rejected():
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": f"o{i}", "source": "A", "target": "B",
+             "min": 0, "max": 1000, "time": i}
+            for i in range(41)
+        ],
+        "rates": [{"node": "B", "max_rate": 1000}],
+        "queries": [],
+    }
+    assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422
+
+
+def test_drift_exactly_40_instants_accepted():
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": f"o{i}", "source": "A", "target": "B",
+             "min": 0, "max": 1000, "time": i}
+            for i in range(38)
+        ],
+        "rates": [{"node": "B", "max_rate": 1000}],
+        "queries": [38, 39],
+    }
+    resp = client.post("/api/v1/diagnose/drift", json=payload)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["feasible"] is True
+
+
+def test_drift_invalid_interval_rejected():
+    payload = _drift_payload(
+        observations=[
+            {"id": "o9", "source": "A", "target": "B",
+             "min": 9, "max": 1, "time": 0}
+        ]
+    )
+    assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422
+
+
+def test_drift_reserved_id_prefix_rejected():
+    payload = _drift_payload(
+        observations=[
+            {"id": "drift:B:0:1", "source": "A", "target": "B",
+             "min": 0, "max": 1, "time": 0}
+        ]
+    )
+    assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422
+
+
+def test_drift_reference_not_in_nodes_rejected():
+    payload = _drift_payload(nodes=["B", "C"])
+    assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422
+
+
+def test_drift_unknown_field_rejected():
+    payload = _drift_payload(bogus=1)
+    assert client.post("/api/v1/diagnose/drift", json=payload).status_code == 422

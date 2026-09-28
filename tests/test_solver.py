@@ -4,10 +4,13 @@ import itertools
 
 from app.solver import (
     CalibrationCandidate,
+    DriftObservation,
+    DriftRate,
     Observation,
     WindowEvent,
     audit_redundancy,
     diagnose,
+    diagnose_drift,
     plan_calibration,
     plan_window_peak,
     suggest_repair,
@@ -796,3 +799,200 @@ def test_redundancy_alternate_long_path_proof_excludes_self():
     assert chain_ids == {"o2", "o3"} and "o1" not in chain_ids
     chain_ids = {s["observation_id"] for s in by_id["o1"]["lower_proof"]}
     assert chain_ids == {"o2", "o3"} and "o1" not in chain_ids
+
+
+# ---------------------------------------------------------------------------
+# 时钟漂移
+# ---------------------------------------------------------------------------
+
+
+def _dobs(id_, source, target, lo, hi, time):
+    return DriftObservation(
+        id=id_, source=source, target=target, min=lo, max=hi, time=time
+    )
+
+
+def _drift_bounds(result):
+    return {(b["time"], b["node"]): (b["lower"], b["upper"])
+            for b in result["query_bounds"]}
+
+
+def test_drift_feasible_query_bounds_meet_at_interpolation_point():
+    # t=0: B-A ∈ [0,10]；t=10: B-A ∈ [90,100]；速率 10ms/s
+    # t=5 须同时满足 |x5-x0|<=50 与 |x10-x5|<=50：两区间 [−50,60] 与 [40,150]
+    # 的交集 [40,60] 即最紧界。
+    result = diagnose_drift(
+        nodes=["A", "B"],
+        reference="A",
+        observations=[
+            _dobs("o1", "A", "B", 0, 10, 0),
+            _dobs("o2", "A", "B", 90, 100, 10),
+        ],
+        rates=[DriftRate("B", 10.0)],
+        query_times=[0, 5, 10],
+    )
+    assert result["feasible"] is True
+    bounds = _drift_bounds(result)
+    assert bounds[(0, "A")] == (0.0, 0.0)
+    assert bounds[(0, "B")] == (0.0, 10.0)
+    assert bounds[(5, "B")] == (40.0, 60.0)
+    assert bounds[(10, "B")] == (90.0, 100.0)
+    # 排序：先按 time 再按 node
+    assert [(b["time"], b["node"]) for b in result["query_bounds"]] == [
+        (0, "A"), (0, "B"), (5, "A"), (5, "B"), (10, "A"), (10, "B")
+    ]
+
+
+def test_drift_rate_zero_keeps_offset_constant_across_time():
+    # 速率 0：t=5 的界直接沿用 t=0 的观测界 [1,5]
+    result = diagnose_drift(
+        nodes=["A", "B"],
+        reference="A",
+        observations=[_dobs("o1", "A", "B", 1, 5, 0)],
+        rates=[DriftRate("B", 0.0)],
+        query_times=[5],
+    )
+    assert result["feasible"] is True
+    assert _drift_bounds(result)[(5, "B")] == (1.0, 5.0)
+
+
+def test_drift_query_at_unobserved_instant_grows_cone():
+    # 仅 t=0 有观测 [0,0]，速率 3；t=2 处漂移锥给出 [-6,6]
+    result = diagnose_drift(
+        nodes=["A", "B"],
+        reference="A",
+        observations=[_dobs("o1", "A", "B", 0, 0, 0)],
+        rates=[DriftRate("B", 3.0)],
+        query_times=[2],
+    )
+    assert result["feasible"] is True
+    assert _drift_bounds(result)[(2, "B")] == (-6.0, 6.0)
+
+
+def test_drift_multi_hop_path_tightens_bounds():
+    # A->B 与 B->C 观测 + 漂移：t=4 处 C 相对 A 的界由两段链推出
+    result = diagnose_drift(
+        nodes=["A", "B", "C"],
+        reference="A",
+        observations=[
+            _dobs("ab", "A", "B", 0, 10, 0),
+            _dobs("bc", "B", "C", 0, 10, 4),
+        ],
+        rates=[DriftRate("B", 1.0), DriftRate("C", 1.0)],
+        query_times=[4],
+    )
+    assert result["feasible"] is True
+    bounds = _drift_bounds(result)
+    # B(4) ∈ [-4,14]（[0,10] 漂移 4），C(4)-B(4) ∈ [0,10] -> C(4)-A ∈ [-4,24]
+    assert bounds[(4, "B")] == (-4.0, 14.0)
+    assert bounds[(4, "C")] == (-4.0, 24.0)
+
+
+def test_drift_isolated_node_bounds_are_null():
+    result = diagnose_drift(
+        nodes=["A", "Z"],
+        reference="A",
+        observations=[],
+        rates=[DriftRate("Z", 1.0)],
+        query_times=[2],
+    )
+    assert result["feasible"] is True
+    assert _drift_bounds(result)[(2, "Z")] == (None, None)
+
+
+def test_drift_infeasible_rate_too_small_cycle_names_segments():
+    # t=0: B-A ∈ [0,10]；t=10: B-A ∈ [100,110]；速率 5ms/s（10 秒最多漂 50）
+    result = diagnose_drift(
+        nodes=["A", "B"],
+        reference="A",
+        observations=[
+            _dobs("o1", "A", "B", 0, 10, 0),
+            _dobs("o2", "A", "B", 100, 110, 10),
+        ],
+        rates=[DriftRate("B", 5.0)],
+        query_times=[5],
+    )
+    assert result["feasible"] is False
+    cycle = result["cycle"]
+    assert cycle["accumulated_bound"] < 0
+    assert cycle["contradiction"] == f"0 <= {cycle['accumulated_bound']}"
+    ids = [s["observation_id"] for s in cycle["steps"]]
+    assert "o1" in ids and "o2" in ids
+    # 矛盾必须沿漂移时段与参考锚时段跨越时刻
+    assert any(s["edge_kind"] == "drift" and s["node"] == "B"
+               and (s["from_time"], s["to_time"]) in ((0, 5), (5, 10))
+               for s in cycle["steps"])
+    assert any(s["edge_kind"] == "reference" for s in cycle["steps"])
+    # 环闭合：下一步的 from 等于上一步的 to（节点+时刻）
+    steps = cycle["steps"]
+    for i, s in enumerate(steps):
+        nxt = steps[(i + 1) % len(steps)]
+        assert (s["to_node"], s["to_time"]) == (nxt["from_node"], nxt["from_time"])
+    assert "query_bounds" not in result
+
+
+def test_drift_infeasible_observation_only_contradiction():
+    result = diagnose_drift(
+        nodes=["A", "B"],
+        reference="A",
+        observations=[
+            _dobs("o1", "A", "B", 0, 10, 0),
+            _dobs("o2", "B", "A", 3, 4, 0),
+        ],
+        rates=[DriftRate("B", 1.0)],
+        query_times=[],
+    )
+    assert result["feasible"] is False
+    ids = {s["observation_id"] for s in result["cycle"]["steps"]}
+    assert ids == {"o1", "o2"}
+    assert all(s["from_time"] == 0 and s["to_time"] == 0
+               for s in result["cycle"]["steps"])
+
+
+def test_drift_reference_pinned_zero_across_unobserved_gap():
+    # 无观测时只有漂移/锚边：系统可行，参考恒 0；
+    # 人为构造参考矛盾不可能（锚边权为 0），这里验证可行侧参考界。
+    result = diagnose_drift(
+        nodes=["A", "B"],
+        reference="A",
+        observations=[_dobs("o1", "A", "B", 2, 2, 3)],
+        rates=[DriftRate("B", 0.5)],
+        query_times=[0, 3, 7],
+    )
+    assert result["feasible"] is True
+    bounds = _drift_bounds(result)
+    assert bounds[(0, "A")] == (0.0, 0.0)
+    assert bounds[(7, "A")] == (0.0, 0.0)
+    # t=3 精确 2；t=0 反向漂移锥 [2-1.5, 2+1.5]=[0.5,3.5]
+    assert bounds[(3, "B")] == (2.0, 2.0)
+    assert bounds[(0, "B")] == (0.5, 3.5)
+    assert bounds[(7, "B")] == (0.0, 4.0)
+
+
+def test_drift_result_independent_of_submission_order():
+    observations = [
+        _dobs("o1", "A", "B", 0, 10, 0),
+        _dobs("o2", "A", "B", 90, 100, 10),
+    ]
+    orders = [observations, observations[::-1]]
+    results = [
+        diagnose_drift(
+            nodes=["A", "B"], reference="A", observations=order,
+            rates=[DriftRate("B", 10.0)], query_times=[5, 0],
+        )
+        for order in orders
+    ]
+    assert results[0] == results[1]
+    assert _drift_bounds(results[0])[(5, "B")] == (40.0, 60.0)
+
+
+def test_drift_no_query_times_returns_empty_bounds_when_feasible():
+    result = diagnose_drift(
+        nodes=["A", "B"],
+        reference="A",
+        observations=[_dobs("o1", "A", "B", 0, 1, 0)],
+        rates=[DriftRate("B", 1.0)],
+        query_times=[],
+    )
+    assert result["feasible"] is True
+    assert result["query_bounds"] == []

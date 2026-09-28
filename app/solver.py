@@ -68,13 +68,30 @@
 附带不含其自身 ID 的上下界替代证据链（与 ``diagnose`` 的证据链同构，
 仅把「参考节点 -> 节点」换成「source -> target」）；任一方向不可达
 或界不满足时标记为非冗余。结果按观测 ID 排序，与提交顺序无关。
+
+时钟漂移
+--------
+``diagnose_drift`` 把时间轴离散为若干整数秒时刻：节点 v 在时刻 t 的偏移
+记为 x_{v,t}（参考节点在所有时刻恒为 0）。两类约束分别展开为差分边：
+
+* 时刻 t 的有向观测 ``x_target,t - x_source,t ∈ [min, max]``——与普通
+  诊断相同的两条边，只是节点变量带时刻下标；
+* 相邻时刻 t_i < t_{i+1}（按观测与查询时刻合并排序）间每个节点 v 的
+  漂移约束 ``|x_{v,t_{i+1}} - x_{v,t_i}| ≤ rate_v·(t_{i+1}-t_i)``，
+  展开为方向相反、权皆为正的两条边；参考节点相邻时刻用零权边互连，
+  把各时刻的参考变量钉在同一个 0 上。
+
+全部边与普通观测同构，因此可行性（负环检测）、矛盾环提取与规范化、
+最紧上下界全部直接复用 ``diagnose``；矛盾环中的漂移边以
+``drift:<node>:<t0>:<t1>`` 形式的漂移时段标识回指，参考锚边以
+``ref:<t0>:<t1>`` 回指，观测边回指原观测 ID。
 """
 
 from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -855,3 +872,191 @@ def audit_redundancy(
             }
         )
     return results
+
+
+# ---------------------------------------------------------------------------
+# 时钟漂移
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DriftObservation:
+    """时刻 time 秒处的一条有向观测：x_target - x_source ∈ [min, max]（毫秒）。"""
+
+    id: str
+    source: str
+    target: str
+    min: float
+    max: float
+    time: int
+
+
+@dataclass(frozen=True)
+class DriftRate:
+    """非参考节点的最大漂移速率（毫秒/秒），须为非负有限值。"""
+
+    node: str
+    rate: float
+
+
+def _var(node: str, time: int) -> str:
+    """编码 (节点, 时刻) 为差分图变量名；以最后一个 '@' 为分隔符解码。"""
+    return f"{node}@{time}"
+
+
+def _decode_var(name: str) -> Tuple[str, int]:
+    """``_var`` 的逆运算：(变量名) -> (节点, 时刻)。"""
+    node, time_text = name.rsplit("@", 1)
+    return node, int(time_text)
+
+
+def _drift_segment_id(node: str, t0: int, t1: int) -> str:
+    """节点 node 在相邻时刻 t0 -> t1 间漂移时段的稳定标识。"""
+    return f"drift:{node}:{t0}:{t1}"
+
+
+def _ref_segment_id(t0: int, t1: int) -> str:
+    """参考节点相邻时刻 t0 -> t1 间零权锚边时段的稳定标识。"""
+    return f"ref:{t0}:{t1}"
+
+
+def diagnose_drift(
+    nodes: Sequence[str],
+    reference: str,
+    observations: Sequence[DriftObservation],
+    rates: Sequence[DriftRate],
+    query_times: Sequence[int],
+):
+    """在离散时间轴上做漂移可行性诊断，并给出查询时刻的最紧偏移界。
+
+    变量宇宙为 ``nodes × 合并时刻``（合并时刻 = 观测时刻 ∪ 查询时刻，
+    按整数秒升序去重）。约束：
+
+    1. 每条时刻 t 的观测展开为普通的上/下界两条边，端点为带时刻的变量；
+    2. 每对相邻时刻 (t_i, t_{i+1})，对每个非参考节点 v 以速率 rate_v
+       展开漂移边 ``t_i -> t_{i+1}`` 与 ``t_{i+1} -> t_i``，
+       权皆为 ``rate_v·(t_{i+1}-t_i)``；参考节点两方向用零权边互连，
+       从而所有时刻的参考偏移同取 0。
+
+    构造出的系统与普通诊断完全同构，直接复用 ``diagnose`` 完成负环检测、
+    矛盾环规范化与双向最短路；参考锚变量取最早合并时刻的参考变量
+    （所有参考变量由零权边强制相等）。
+
+    返回字典：
+      可行   -> {"feasible": True, "reference": ..., "query_bounds": [...]}
+                query_bounds 按 (time, node) 升序，每项含
+                time/node/lower/upper，不可达方向为 None，
+                参考节点两界恒为 0.0；
+      不可行 -> {"feasible": False, "cycle": {"steps": [...],
+                 "accumulated_bound": float, "contradiction": str}}
+                每步额外给出 from_time/to_time 与 edge_kind
+                （observation / drift / reference），
+                observation_id 为原观测 ID 或漂移/参考时段标识。
+
+    调用方须保证：每个非参考节点都给出速率、时刻非负且观测/查询合计
+    至多 40 个不同时刻（输入合法性在 FastAPI 模型层校验）。
+    """
+    ordered_nodes = sorted(set(nodes))
+    instants = sorted({o.time for o in observations} | set(query_times))
+    rate_by_node: Dict[str, float] = {r.node: r.rate for r in rates}
+
+    # 无任何时刻（观测与查询均为空）：时间轴为空，系统平凡可行，无界可给。
+    if not instants:
+        return {"feasible": True, "reference": reference, "query_bounds": []}
+
+    variables = [_var(node, t) for t in instants for node in ordered_nodes]
+    ref_variable = _var(reference, instants[0])
+
+    # 时刻观测：直接复用普通观测的边展开规则。
+    synthetic_observations: List[Observation] = [
+        Observation(
+            id=o.id,
+            source=_var(o.source, o.time),
+            target=_var(o.target, o.time),
+            min=o.min,
+            max=o.max,
+        )
+        for o in observations
+    ]
+
+    # 相邻时刻：漂移约束与参考锚约束。
+    for t0, t1 in zip(instants, instants[1:]):
+        span = t1 - t0
+        for node in ordered_nodes:
+            segment_id = (
+                _ref_segment_id(t0, t1)
+                if node == reference
+                else _drift_segment_id(node, t0, t1)
+            )
+            weight = 0.0 if node == reference else _norm(rate_by_node[node] * span)
+            # |x1 - x0| <= w  ⇔  x1 - x0 <= w 且 x0 - x1 <= w
+            synthetic_observations.append(
+                Observation(
+                    id=segment_id,
+                    source=_var(node, t0),
+                    target=_var(node, t1),
+                    min=-weight,
+                    max=weight,
+                )
+            )
+
+    result = diagnose(
+        nodes=variables,
+        reference=ref_variable,
+        observations=synthetic_observations,
+    )
+
+    if not result["feasible"]:
+        steps = []
+        for s in result["cycle"]["steps"]:
+            from_node, from_time = _decode_var(s["from"])
+            to_node, to_time = _decode_var(s["to"])
+            obs_id = s["observation_id"]
+            if obs_id.startswith("drift:"):
+                edge_kind = "drift"
+            elif obs_id.startswith("ref:"):
+                edge_kind = "reference"
+            else:
+                edge_kind = "observation"
+            steps.append(
+                {
+                    "observation_id": obs_id,
+                    "edge_kind": edge_kind,
+                    "node": from_node if edge_kind == "drift" else None,
+                    "from_node": from_node,
+                    "to_node": to_node,
+                    "from_time": from_time,
+                    "to_time": to_time,
+                    "constraint": s["constraint"],
+                    "weight": s["weight"],
+                    "bound": s["bound"],
+                }
+            )
+        return {
+            "feasible": False,
+            "cycle": {
+                "steps": steps,
+                "accumulated_bound": result["cycle"]["accumulated_bound"],
+                "contradiction": result["cycle"]["contradiction"],
+            },
+        }
+
+    bounds_by_variable = {b["node"]: b for b in result["node_bounds"]}
+    query_bounds = []
+    for t in sorted(set(query_times)):
+        for node in ordered_nodes:
+            if node == reference:
+                query_bounds.append(
+                    {"time": t, "node": node, "lower": 0.0, "upper": 0.0}
+                )
+                continue
+            b = bounds_by_variable[_var(node, t)]
+            query_bounds.append(
+                {"time": t, "node": node, "lower": b["lower"], "upper": b["upper"]}
+            )
+
+    return {
+        "feasible": True,
+        "reference": reference,
+        "query_bounds": query_bounds,
+    }
