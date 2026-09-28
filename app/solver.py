@@ -114,6 +114,37 @@ class WindowEvent:
     timestamp: float
 
 
+@dataclass(frozen=True)
+class DriftObservation:
+    """带整数采样秒数的有向时钟观测。
+
+    在 ``second`` 秒采样时刻，满足
+    ``x_target(second) - x_source(second) ∈ [min, max]``（毫秒）。
+    """
+
+    id: str
+    source: str
+    target: str
+    second: int
+    min: float
+    max: float
+
+
+# 漂移约束边的类型：
+# forward  -> x_v(t2) - x_v(t1) <= rate*(t2-t1)（偏移增量上界）
+# backward -> x_v(t1) - x_v(t2) <= rate*(t2-t1)（偏移增量下界）
+_DRIFT_FORWARD = "drift_forward"
+_DRIFT_BACKWARD = "drift_backward"
+
+
+def drift_segment_id(node: str, start: int, end: int) -> str:
+    """漂移时段标识：``drift:<node>:<start>:<end>``。
+
+    时间展开图中的漂移边以此作为矛盾环中的稳定回指标识，与观测 ID 互不混淆。
+    """
+    return f"drift:{node}:{start}:{end}"
+
+
 def _norm(value: float) -> float:
     """归一化浮点输出：避免 -0.0，并保持有限数值。"""
     if value == 0:
@@ -247,7 +278,14 @@ def _extract_negative_cycle(
 
 def _canonicalize_cycle(cycle_edges: List[Edge]) -> List[Edge]:
     """将环旋转为唯一表示：以 (起点节点, 观测 ID, 类型) 字典序最小的边开头。"""
-    kind_rank = {"upper": 0, "lower": 1}
+    kind_rank = {
+        "upper": 0,
+        "lower": 1,
+        _DRIFT_FORWARD: 2,
+        _DRIFT_BACKWARD: 3,
+        "window_upper": 4,
+        "window_lower": 5,
+    }
     keys = [
         (e.u, e.observation_id, kind_rank[e.kind]) for e in cycle_edges
     ]
@@ -855,3 +893,186 @@ def audit_redundancy(
             }
         )
     return results
+
+
+# ---------------------------------------------------------------------------
+# 时间漂移诊断
+# ---------------------------------------------------------------------------
+
+
+def _drift_edges(
+    nodes: Sequence[str],
+    reference: str,
+    observations: Sequence[DriftObservation],
+    timeline: Sequence[int],
+    rates: dict,
+) -> List[Edge]:
+    """构造时间展开差分约束图的全部边（观测边 + 相邻时刻漂移边）。
+
+    变量为 ``(node, second)`` 对，表示 second 秒时该节点相对参考时钟的偏移。
+
+    * 观测边：``x_target(t) - x_source(t) ∈ [min, max]`` 展开为
+      ``source(t) -> target(t)``（权 max）与 ``target(t) -> source(t)``（权 -min）；
+    * 漂移边：相邻时刻 ``t1 < t2`` 同一节点偏移变化绝对值不超过
+      ``rate * (t2 - t1)``，展开为双向同权边；参考节点速率恒按 0 处理，
+      即其各时刻偏移被钉为 0。
+
+    边按 (标识, 类型) 排序后返回，保证松弛顺序与矛盾环提取完全确定。
+    """
+    edges: List[Edge] = []
+
+    for obs in observations:
+        edges.append(
+            Edge(
+                u=(obs.source, obs.second),
+                v=(obs.target, obs.second),
+                weight=_norm(obs.max),
+                observation_id=obs.id,
+                kind="upper",
+                bound=obs.max,
+            )
+        )
+        edges.append(
+            Edge(
+                u=(obs.target, obs.second),
+                v=(obs.source, obs.second),
+                weight=_norm(-obs.min),
+                observation_id=obs.id,
+                kind="lower",
+                bound=obs.min,
+            )
+        )
+
+    for t1, t2 in zip(timeline, timeline[1:]):
+        dt = t2 - t1
+        for node in nodes:
+            rate = 0.0 if node == reference else rates[node]
+            span = _norm(rate * dt)
+            segment = drift_segment_id(node, t1, t2)
+            edges.append(
+                Edge(
+                    u=(node, t1),
+                    v=(node, t2),
+                    weight=span,
+                    observation_id=segment,
+                    kind=_DRIFT_FORWARD,
+                    bound=span,
+                )
+            )
+            edges.append(
+                Edge(
+                    u=(node, t2),
+                    v=(node, t1),
+                    weight=span,
+                    observation_id=segment,
+                    kind=_DRIFT_BACKWARD,
+                    bound=span,
+                )
+            )
+
+    kind_rank = {
+        "upper": 0,
+        "lower": 1,
+        _DRIFT_FORWARD: 2,
+        _DRIFT_BACKWARD: 3,
+    }
+    edges.sort(key=lambda e: (e.observation_id, kind_rank[e.kind]))
+    return edges
+
+
+def _drift_cycle_step(edge: Edge) -> dict:
+    """把时间展开图矛盾环上的一条边渲染为对外步骤字典。"""
+    if edge.kind in (_DRIFT_FORWARD, _DRIFT_BACKWARD):
+        return {
+            "type": "drift",
+            "segment_id": edge.observation_id,
+            "node": edge.u[0],
+            "from_second": edge.u[1],
+            "to_second": edge.v[1],
+            "constraint": "forward" if edge.kind == _DRIFT_FORWARD else "backward",
+            "weight": _norm(edge.weight),
+            "bound": _norm(edge.bound),
+        }
+    return {
+        "type": "observation",
+        "observation_id": edge.observation_id,
+        "from": {"node": edge.u[0], "second": edge.u[1]},
+        "to": {"node": edge.v[0], "second": edge.v[1]},
+        "constraint": edge.kind,
+        "weight": _norm(edge.weight),
+        "bound": _norm(edge.bound),
+    }
+
+
+def diagnose_drift(
+    nodes: Sequence[str],
+    reference: str,
+    observations: Sequence[DriftObservation],
+    rates: dict,
+    timeline: Sequence[int],
+    query_seconds: Sequence[int],
+):
+    """时间轴漂移可行性诊断。
+
+    将每个节点在各时刻的偏移建模为时间展开图中的变量
+    ``(node, second)``：观测给出同一时刻两端点偏移的区间，相邻时刻同一
+    节点的偏移变化由非负漂移速率限制（参考节点速率恒为 0，即各时刻偏移
+    恒为 0）。建图后完全复用现有的负环检测与双向 Bellman-Ford 求解。
+
+    返回字典：
+      可行   -> {"feasible": True, "reference": ..., "timeline": [...],
+                 "queries": [{"second": int, "node_bounds": [...]}]}
+                各 query 按 second 升序，node_bounds 按节点字典序；
+                不可达方向的界为 None。
+      不可行 -> {"feasible": False,
+                 "cycle": {"steps": [...], "accumulated_bound": float,
+                           "contradiction": str}}
+                步骤分两类（type=observation / drift），分别回指
+                原观测 ID 或漂移时段标识 drift:<node>:<start>:<end>。
+    """
+    ordered_nodes = sorted(set(nodes))
+    ordered_timeline = sorted(timeline)
+    # 时间展开后的节点宇宙：节点 × 时刻，tuple 字典序即确定顺序。
+    expanded_nodes = [(n, t) for n in ordered_nodes for t in ordered_timeline]
+    edges = _drift_edges(
+        ordered_nodes, reference, observations, ordered_timeline, rates
+    )
+
+    cycle_edges = _extract_negative_cycle(edges, expanded_nodes)
+    if cycle_edges is not None:
+        cycle_edges = _canonicalize_cycle(cycle_edges)
+        steps = [_drift_cycle_step(e) for e in cycle_edges]
+        total = _norm(sum(e.weight for e in cycle_edges))
+        return {
+            "feasible": False,
+            "cycle": {
+                "steps": steps,
+                "accumulated_bound": total,
+                "contradiction": f"0 <= {total}",
+            },
+        }
+
+    reverse_edges = [_unreverse(e) for e in edges]
+    inf = float("inf")
+    queries: List[dict] = []
+    for second in sorted(query_seconds):
+        source = (reference, second)
+        # 正图：参考时刻到各节点的最短路 = 该时刻偏移上界。
+        dist, _ = _bellman_ford(edges, expanded_nodes, source)
+        # 反图：各节点回到参考时刻的最短路取负 = 偏移下界。
+        dist_rev, _ = _bellman_ford(reverse_edges, expanded_nodes, source)
+
+        node_bounds = []
+        for node in ordered_nodes:
+            key = (node, second)
+            upper = _norm(dist[key]) if dist[key] != inf else None
+            lower = _norm(-dist_rev[key]) if dist_rev[key] != inf else None
+            node_bounds.append({"node": node, "lower": lower, "upper": upper})
+        queries.append({"second": second, "node_bounds": node_bounds})
+
+    return {
+        "feasible": True,
+        "reference": reference,
+        "timeline": list(ordered_timeline),
+        "queries": queries,
+    }

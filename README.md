@@ -23,7 +23,12 @@
    已被其余观测蕴含——剩余观测推出的 `target − source` 最紧下界不小于原
    `min`、最紧上界不大于原 `max` 时标为冗余，并附**不含自身 ID** 的上下界
    替代证据链及界值；基础观测矛盾时直接返回现有矛盾环；
-8. 提供 **批量诊断接口**，结果按提交下标稳定返回。
+8. **时间漂移诊断**：提交带**整数采样秒数**的有向观测与各非参考节点的
+   **非负最大漂移速率**（毫秒/秒），在时间展开的差分约束图上判断**整条时间轴
+   是否可行**；可行时按查询秒数（至多 8 个）与节点排序给出各时刻相对参考节点
+   的最紧偏移上下界，不可达方向为 `null`；不可行时返回包含**原观测 ID 或漂移
+   时段标识**的矛盾环；
+9. 提供 **批量诊断接口**，结果按提交下标稳定返回。
 
 算法：差分约束图 + Bellman-Ford（超源初始化检测负环、前驱指针回卷提取矛盾环），
 纯 Python 标准实现，无外部服务依赖。
@@ -741,6 +746,148 @@ curl -s -X POST http://localhost:8000/api/v1/events/window-peak \
 }
 ```
 
+### `POST /api/v1/diagnose/drift` — 时间漂移诊断
+
+在**整数秒时间轴**上诊断多个节点的偏移是否自洽。变量为每个节点在各时刻的偏移
+`x_node(second)`，约束有两类：
+
+1. **观测约束**（同一采样时刻）：
+   `x_target(second) − x_source(second) ∈ [min, max]`（毫秒）；
+2. **漂移约束**（相邻时刻）：对时间轴上相邻的两个时刻
+   `t₁ < t₂`（时间轴 = 全部观测秒数与查询秒数去重后升序排列），同一节点偏移
+   变化的绝对值不超过 `rate × (t₂ − t₁)`（`rate` 为该节点的非负最大漂移速率，
+   单位毫秒/秒），即 `|x_node(t₂) − x_node(t₁)| ≤ rate × (t₂ − t₁)`。
+
+**参考节点在每个时刻的偏移恒为 0**（其速率固定为 0，无需也不允许提供）。
+建模方式为时间展开差分约束图（变量是 `(节点, 秒数)` 对），直接复用与单条诊断
+相同的 Bellman-Ford 负环检测与双向最短路：存在负环即整条时间轴不可行。
+
+请求体：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `reference` | string | 是 | 参考时钟节点（各时刻偏移恒为 0） |
+| `observations` | array | 否 | 带整数采样秒数的观测列表，默认空数组，ID 不可重复 |
+| `observations[].id` | string | 是 | 观测唯一 ID（矛盾环按它回指） |
+| `observations[].source` / `target` | string | 是 | 被减时钟节点 A / B |
+| `observations[].second` | integer | 是 | **非负整数**采样秒数（不接受浮点/布尔/字符串） |
+| `observations[].min` / `max` | number | 是 | 该采样时刻 `x_target − x_source` 的区间（毫秒），`min ≤ max` |
+| `rates` | array | 是 | 各**非参考节点**的非负最大漂移速率；节点不可重复 |
+| `rates[].node` | string | 是 | 非参考时钟节点 |
+| `rates[].rate` | number | 是 | 最大漂移速率（毫秒/秒），须为 **≥ 0 的有限数值** |
+| `query_seconds` | integer[] | 否 | **至多 8 个**非负整数查询秒数，彼此不同，默认空数组 |
+| `nodes` | string[] | 否 | 显式节点列表；缺省取观测端点与 `reference` 的并集 |
+| `name` | string | 否 | 可选名称，响应原样回显 |
+
+其他限制：
+
+- 观测秒数与查询秒数合计涉及的**不同时刻至多 40 个**（同一秒可以有多条观测）；
+- 节点宇宙为「显式 `nodes` ∪ `reference` ∪ 观测端点」；其中**每个非参考节点都
+  必须给出速率**（缺失返回 422）；参考节点不允许给速率；给未知节点速率也返回 422。
+
+#### 可行响应（示例）
+
+`t=0` 观测 `B − A ∈ [0, 10]`，B 的漂移速率为 1 毫秒/秒：`t=10` 时偏移界放宽到
+`[-10, 20]`（仅相邻时刻之间有漂移约束）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/drift \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "o0", "source": "A", "target": "B", "second": 0, "min": 0, "max": 10}
+    ],
+    "rates": [{"node": "B", "rate": 1}],
+    "query_seconds": [10, 0]
+  }'
+```
+
+```json
+{
+  "feasible": true,
+  "reference": "A",
+  "name": null,
+  "timeline": [0, 10],
+  "queries": [
+    {"second": 0, "node_bounds": [
+      {"node": "A", "lower": 0.0, "upper": 0.0},
+      {"node": "B", "lower": 0.0, "upper": 10.0}
+    ]},
+    {"second": 10, "node_bounds": [
+      {"node": "A", "lower": 0.0, "upper": 0.0},
+      {"node": "B", "lower": -10.0, "upper": 20.0}
+    ]}
+  ]
+}
+```
+
+- `timeline`：观测与查询涉及的全部不同时刻，按秒数升序；
+- `queries`：**按查询秒数升序**（与提交顺序无关），每个查询的 `node_bounds`
+  **按节点字典序**；
+- `lower` / `upper` 即该时刻 `x_node(second) − x_reference(second)` 的最紧下/上界
+  （毫秒）；参考节点恒为 `[0, 0]`；某方向沿时间展开图不可达时对应界为 `null`
+  （例如从未与参考节点有任何观测连通的孤岛节点）。
+
+#### 不可行响应（矛盾环，示例）
+
+`t=0` 观测 `B − A ∈ [0, 2]`，`t=1` 观测 `B − A ∈ [10, 12]`，而 B 的速率为 5
+毫秒/秒（1 秒最多变化 5，观测却要求至少变化 8）：整条时间轴不可行。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/drift \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "o0", "source": "A", "target": "B", "second": 0, "min": 0, "max": 2},
+      {"id": "o1", "source": "A", "target": "B", "second": 1, "min": 10, "max": 12}
+    ],
+    "rates": [{"node": "B", "rate": 5}],
+    "query_seconds": [1]
+  }'
+```
+
+```json
+{
+  "feasible": false,
+  "name": null,
+  "cycle": {
+    "steps": [
+      {"type": "observation", "observation_id": "o0",
+       "from": {"node": "A", "second": 0}, "to": {"node": "B", "second": 0},
+       "constraint": "upper", "weight": 2.0, "bound": 2.0},
+      {"type": "drift", "segment_id": "drift:B:0:1",
+       "node": "B", "from_second": 0, "to_second": 1,
+       "constraint": "forward", "weight": 5.0, "bound": 5.0},
+      {"type": "observation", "observation_id": "o1",
+       "from": {"node": "B", "second": 1}, "to": {"node": "A", "second": 1},
+       "constraint": "lower", "weight": -10.0, "bound": 10.0},
+      {"type": "drift", "segment_id": "drift:A:0:1",
+       "node": "A", "from_second": 1, "to_second": 0,
+       "constraint": "backward", "weight": 0.0, "bound": 0.0}
+    ],
+    "accumulated_bound": -3.0,
+    "contradiction": "0 <= -3.0"
+  }
+}
+```
+
+矛盾环的步骤有两类（由 `type` 区分，环上首尾闭合）：
+
+- **`"type": "observation"`**：来自一条原观测，`observation_id` 回指其 ID，
+  `from` / `to` 为带秒数的时间点，`constraint` 为 `upper`（对应 `max`）/
+  `lower`（对应 `-min`），与单条诊断的矛盾环同构；
+- **`"type": "drift"`**：来自相邻时刻的漂移限制，`segment_id` 为漂移时段标识
+  **`drift:<node>:<from_second>:<to_second>`**，`constraint` 为：
+  - `forward`：增量上界 `x(t₂) − x(t₁) ≤ rate·Δt`（时间点从早到晚）；
+  - `backward`：增量下界 `x(t₁) − x(t₂) ≤ rate·Δt`（时间点从晚到早）；
+  - `weight` / `bound` 均为允许的最大偏移变化量 `rate·Δt`
+    （参考节点速率为 0，故其漂移边权为 0，把参考节点在各时刻钉为同一值）。
+
+不可行时**不返回任何查询界**；仅由同一时刻观测构成的矛盾，环上只含
+`observation` 步骤。
+
 ### `POST /api/v1/diagnose/batch` — 批量诊断
 
 请求体 `{"diagnoses": [ <单条请求>, ... ]}`（至少 1 条）。每条可带 `name`，
@@ -772,6 +919,10 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
 基础观测 ID 冲突、候选区间非法等。窗口峰值接口还会拒绝：`events` 超过 12 条、
 事件 ID 重复、事件时间戳非有限数值（NaN/±inf）、窗口端点非有限数值或
 `start > end`、缺少 `window` 等。冗余审计接口还会拒绝：观测超过 30 条。
+时间漂移接口还会拒绝：采样秒数或查询秒数为负数/非整数（含布尔、浮点、字符串）、
+查询秒数超过 8 个或彼此重复、观测与查询涉及的不同时刻合计超过 40 个、观测 ID 重复、
+节点宇宙中缺少非参考节点的漂移速率、给参考节点或未知节点配置速率、
+速率为负或非有限数值等。
 
 ---
 
@@ -807,6 +958,16 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
   `x_target − x_source` 的最紧上下界；下界 ≥ `o.min` 且上界 ≤ `o.max`
   （带与界宽检查相同的浮点容差）时 `o` 冗余，其替代证据链即剩余图中的
   规范最短链，必不含 `o` 自身 ID；结果按观测 ID 排序，与提交顺序无关。
+- **时间漂移**：把每个节点在各整数秒的偏移展开为变量 `(节点, 秒数)`。观测
+  `x_B(t) − x_A(t) ∈ [min, max]` 展开为同时刻两条边（与单条诊断一致）；
+  相邻时刻 `t₁ < t₂` 的漂移限制
+  `|x_n(t₂) − x_n(t₁)| ≤ rate·(t₂−t₁)` 展开为同一节点两个时间点之间的
+  一对双向同权边（标识 `drift:<node>:<t₁>:<t₂>`，权 `rate·Δt`）；参考节点
+  速率恒取 0，其各时间点即被零权边钉为同一值（偏移恒 0）。时间轴由全部观测
+  秒数与查询秒数去重排序得到，漂移边只连接时间轴上**相邻**的时刻；建图后
+  完全复用同一套负环检测（可行性）与以 `(reference, 查询秒)` 为源的双向
+  Bellman-Ford（最紧上下界，不可达方向为 `null`）。矛盾环上的边按类型回指
+  原观测 ID 或漂移时段标识，环经规范化旋转，结果与观测/速率的提交顺序无关。
 
 结果顺序的确定性保证：
 
@@ -821,9 +982,9 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
 
 ```
 app/
-  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/api/v1/diagnose/redundancy-audit、/api/v1/events/window-peak、/health
-  models.py    # 请求/响应 Pydantic 模型与入参校验
-  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准方案、窗口峰值求解与可行偏移见证、逐条观测冗余审计
+  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/drift、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/api/v1/diagnose/redundancy-audit、/api/v1/events/window-peak、/health
+  models.py    # 请求/响应 Pydantic 模型与入参校验（含时间漂移请求/矛盾环/查询界模型）
+  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准方案、窗口峰值求解与可行偏移见证、逐条观测冗余审计、时间展开的漂移诊断
 tests/         # 算法层与 HTTP 接口测试
 Dockerfile
 docker-compose.yml

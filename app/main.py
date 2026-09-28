@@ -20,24 +20,36 @@ from .models import (
     CycleStep,
     DiagnosisRequest,
     DiagnosisResponse,
+    DriftContradictionCycle,
+    DriftDiagnosisRequest,
+    DriftDiagnosisResponse,
+    DriftNodeBounds,
+    DriftObservationCycleStep,
+    DriftQueryResult,
+    DriftSegmentCycleStep,
     FeasibleDiagnosis,
+    FeasibleDriftDiagnosis,
     InfeasibleDiagnosis,
+    InfeasibleDriftDiagnosis,
     NodeOffset,
     RedundancyAuditRequest,
     RedundancyAuditResponse,
     RedundancyItem,
     RepairRequest,
     RepairResponse,
+    TimePoint,
     WindowPeakRequest,
     WindowPeakResponse,
     collect_nodes,
 )
 from .solver import (
     CalibrationCandidate,
+    DriftObservation,
     Observation,
     WindowEvent,
     audit_redundancy,
     diagnose,
+    diagnose_drift,
     plan_calibration,
     plan_window_peak,
     suggest_repair,
@@ -53,9 +65,11 @@ app = FastAPI(
         "并可进一步给出最小观测删除集合的修复建议；"
         "还可从带成本的候选观测中规划满足目标界宽的最小成本校准方案；"
         "另可在真实时间窗口下求同时入窗的最大事件集合及可行偏移见证；"
-        "并可逐条审计观测区间是否已被其余观测蕴含（冗余审计）。"
+        "并可逐条审计观测区间是否已被其余观测蕴含（冗余审计）；"
+        "时间漂移接口在时间展开的差分约束图上检查整条时间轴是否可行，"
+        "可行时给出各查询时刻相对参考节点的最紧偏移上下界。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -165,6 +179,96 @@ def diagnose_batch(request: BatchDiagnosisRequest) -> BatchDiagnosisResponse:
         for i, req in enumerate(request.diagnoses)
     ]
     return BatchDiagnosisResponse(count=len(items), results=items)
+
+
+def _to_drift_observation(raw) -> DriftObservation:
+    return DriftObservation(
+        id=raw.id,
+        source=raw.source,
+        target=raw.target,
+        second=raw.second,
+        min=raw.min,
+        max=raw.max,
+    )
+
+
+def _drift_cycle_step_model(step):
+    """把 solver 返回的矛盾环步骤字典包装为对应响应模型（按 type 分派）。"""
+    if step["type"] == "drift":
+        return DriftSegmentCycleStep(
+            segment_id=step["segment_id"],
+            node=step["node"],
+            from_second=step["from_second"],
+            to_second=step["to_second"],
+            constraint=step["constraint"],
+            weight=step["weight"],
+            bound=step["bound"],
+        )
+    return DriftObservationCycleStep(
+        observation_id=step["observation_id"],
+        from_=TimePoint(node=step["from"]["node"], second=step["from"]["second"]),
+        to=TimePoint(node=step["to"]["node"], second=step["to"]["second"]),
+        constraint=step["constraint"],
+        weight=step["weight"],
+        bound=step["bound"],
+    )
+
+
+def _drift_diagnosis_model(name, result) -> DriftDiagnosisResponse:
+    """把时间漂移 solver 返回的字典包装为响应模型。"""
+    if result["feasible"]:
+        queries = [
+            DriftQueryResult(
+                second=q["second"],
+                node_bounds=[
+                    DriftNodeBounds(node=b["node"], lower=b["lower"], upper=b["upper"])
+                    for b in q["node_bounds"]
+                ],
+            )
+            for q in result["queries"]
+        ]
+        return FeasibleDriftDiagnosis(
+            name=name,
+            reference=result["reference"],
+            timeline=result["timeline"],
+            queries=queries,
+        )
+
+    cycle = result["cycle"]
+    return InfeasibleDriftDiagnosis(
+        name=name,
+        cycle=DriftContradictionCycle(
+            steps=[_drift_cycle_step_model(s) for s in cycle["steps"]],
+            accumulated_bound=cycle["accumulated_bound"],
+            contradiction=cycle["contradiction"],
+        ),
+    )
+
+
+@app.post(
+    "/api/v1/diagnose/drift",
+    response_model=DriftDiagnosisResponse,
+    tags=["diagnosis"],
+)
+def diagnose_drift_once(request: DriftDiagnosisRequest) -> DriftDiagnosisResponse:
+    """时间漂移诊断：沿整条时间轴检查可行性并求查询时刻最紧偏移界。
+
+    每个节点在各整数采样秒的偏移建模为时间展开差分变量；观测约束同一时刻
+    两端点偏移之差，漂移约束相邻时刻同一节点偏移变化不超过
+    ``rate * 时间差``（参考节点各时刻偏移恒为 0）。直接复用现有差分约束
+    求解器：负环即整条时间轴不可行，矛盾环回指原观测 ID 或漂移时段标识；
+    可行时按查询秒数与节点排序给出相对参考节点的最紧上下界。
+    """
+    timeline = sorted({o.second for o in request.observations} | set(request.query_seconds))
+    result = diagnose_drift(
+        nodes=request.effective_nodes(),
+        reference=request.reference,
+        observations=[_to_drift_observation(o) for o in request.observations],
+        rates={r.node: r.rate for r in request.rates},
+        timeline=timeline,
+        query_seconds=request.query_seconds,
+    )
+    return _drift_diagnosis_model(request.name, result)
 
 
 @app.post(
